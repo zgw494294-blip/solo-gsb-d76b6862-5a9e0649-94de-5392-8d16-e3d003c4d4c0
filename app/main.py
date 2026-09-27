@@ -36,7 +36,16 @@ abundance from one isotope (donor) to another (receptor) inside one group,
 and the exact right derivative dP(shift)/d(epsilon) at epsilon = 0 of the
 full envelope is returned per transfer — symbolically, never by finite
 differences, and keeping peaks whose baseline probability is zero but whose
-derivative is not.
+derivative is not. A tenth endpoint infers finite-bath exchange
+trajectories: a molecule of n sites and a bath of m sites start with h and
+b heavy isotopes, and each step swaps one uniformly and independently
+chosen molecule site with one bath site (same-type swaps count as steps,
+the bath updates synchronously and the total heavy count is conserved), so
+the molecule heavy count is a birth-death chain; given closed-interval
+observations of that count at distinct steps it returns their exact joint
+probability and, conditioned on all of them, the exact heavy-count
+distribution at every step, again exactly over Q and never enumerating
+exchange sequences.
 """
 
 from __future__ import annotations
@@ -461,6 +470,60 @@ class AbundanceSensitivityResponse(BaseModel):
     # derivatives[t]: non-zero dP(shift)/d(epsilon) values of transfer t
     # (input order), ascending by shift.
     derivatives: List[List[DerivativePeak]]
+
+
+class ExchangeObservation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    step: int = Field(strict=True, ge=0)
+    lower: int = Field(strict=True, ge=0)
+    upper: int = Field(strict=True, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_observation(self) -> "ExchangeObservation":
+        if self.lower > self.upper:
+            raise ValueError("lower must be <= upper")
+        return self
+
+
+class ExchangeTrajectoryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    n: int = Field(strict=True, ge=1, le=40)
+    m: int = Field(strict=True, ge=1, le=40)
+    h: int = Field(strict=True, ge=0)
+    b: int = Field(strict=True, ge=0)
+    steps: int = Field(strict=True, ge=0, le=80)
+    observations: List[ExchangeObservation] = Field(min_length=0, max_length=8)
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "ExchangeTrajectoryRequest":
+        if self.h > self.n:
+            raise ValueError("h must satisfy 0 <= h <= n")
+        if self.b > self.m:
+            raise ValueError("b must satisfy 0 <= b <= m")
+        steps_seen = [obs.step for obs in self.observations]
+        if len(set(steps_seen)) != len(steps_seen):
+            raise ValueError("observation steps must be distinct")
+        for obs in self.observations:
+            if obs.step > self.steps:
+                raise ValueError("observation step must be <= steps")
+            if obs.upper > self.n:
+                raise ValueError("observation upper must be <= n")
+        return self
+
+
+class HeavyCountPeak(BaseModel):
+    heavy_count: int
+    probability: str  # reduced fraction "n/d"
+
+
+class ExchangeTrajectoryResponse(BaseModel):
+    probability: str  # reduced fraction "n/d"
+    # distributions[t]: conditional law of the molecule heavy count at step t
+    # given all observations; non-zero entries ascending by heavy_count.
+    # Omitted when the observations have joint probability zero.
+    distributions: Optional[List[List[HeavyCountPeak]]] = None
 
 
 def convolve(left: Distribution, right: Distribution) -> Distribution:
@@ -1331,7 +1394,133 @@ def transfer_derivative(
     return dist
 
 
-app = FastAPI(title="Isotope Envelope API", version="1.8.0")
+def exchange_trajectory(
+    n: int,
+    m: int,
+    h: int,
+    b: int,
+    steps: int,
+    observations: List[Tuple[int, int, int]],
+) -> Tuple[Fraction, Optional[List[Dict[int, Fraction]]]]:
+    """Exact finite-bath exchange-trajectory inference, over Q.
+
+    A molecule of ``n`` sites starts with ``h`` heavy isotopes and a bath of
+    ``m`` sites with ``b``; each step picks one molecule site and one bath
+    site uniformly and independently (all ``n*m`` pairs equally likely) and
+    swaps their isotopes — same-type swaps count as steps. The bath holds
+    the remaining ``T - X_t`` heavy isotopes (``T = h + b`` is conserved),
+    so the molecule heavy count X_t is a birth-death chain on 0..n whose
+    one-step transitions all share the denominator ``n*m``, with integer
+    numerators
+
+        up(x)   = (n - x) * (T - x)        (light site out, heavy site in)
+        down(x) = x * (m - T + x)          (heavy site out, light site in)
+        stay(x) = n*m - up(x) - down(x)    (same-type swaps)
+
+    which vanish exactly at the feasible boundary
+    max(0, T - m) <= x <= min(n, T). ``observations`` lists
+    ``(step, lower, upper)`` constraints ``lower <= X_step <= upper`` at
+    distinct steps (step 0 is the initial state, X_0 = h). Returns the
+    exact joint probability of all observations and, when it is non-zero,
+    for every step 0..steps the conditional distribution of X_t given all
+    observations as a count -> probability mapping; a zero joint
+    probability yields ``(0, None)``.
+
+    The forward pass tracks exact integer weights ``A_t`` with
+    ``alpha_t(x) = A_t[x] / (n*m)**t``, zeroing every state that violates
+    the observation at its step; the remaining mass at the last observed
+    step ``last`` is the joint probability ``z / (n*m)**last``. The
+    backward pass tracks ``B_t(x) = P(later observations | X_t = x) *
+    (n*m)**(last - t)`` over the same integer weights, so each conditional
+    probability is the single Fraction reduction
+    ``A_t[x] * B_t[x] / z``; steps after ``last`` carry ``B = 1`` and pick
+    up the denominator factor ``(n*m)**(t - last)``. No exchange sequence
+    is ever enumerated.
+    """
+    total = h + b  # conserved heavy-isotope count (molecule + bath)
+    denom = n * m  # every one-step transition has this denominator
+
+    # Integer transition numerators at molecule heavy count x.
+    ups = [(n - x) * (total - x) for x in range(n + 1)]
+    downs = [x * (m - total + x) for x in range(n + 1)]
+    stays = [denom - ups[x] - downs[x] for x in range(n + 1)]
+
+    filters = {step: (lower, upper) for step, lower, upper in observations}
+
+    # Forward pass over exact integer weights: alpha_t(x) = A_t[x]/denom**t,
+    # with states violating an observation zeroed at its step.
+    forward: List[Dict[int, int]] = []
+    current: Dict[int, int] = {h: 1}
+    if 0 in filters:
+        lower, upper = filters[0]
+        if not lower <= h <= upper:
+            current = {}
+    forward.append(current)
+    for t in range(1, steps + 1):
+        nxt: Dict[int, int] = {}
+        for x, weight in current.items():
+            if stays[x]:
+                nxt[x] = nxt.get(x, 0) + weight * stays[x]
+            if ups[x]:
+                nxt[x + 1] = nxt.get(x + 1, 0) + weight * ups[x]
+            if downs[x]:
+                nxt[x - 1] = nxt.get(x - 1, 0) + weight * downs[x]
+        if t in filters:
+            lower, upper = filters[t]
+            nxt = {x: w for x, w in nxt.items() if lower <= x <= upper}
+        forward.append(nxt)
+        current = nxt
+
+    if not filters:
+        # No observations: the joint event is certain and the conditional
+        # law at step t is the unconditional one.
+        distributions = [
+            {x: Fraction(weight, denom**t) for x, weight in forward[t].items()}
+            for t in range(steps + 1)
+        ]
+        return Fraction(1), distributions
+
+    last = max(filters)
+    z_num = sum(forward[last].values())
+    if z_num == 0:
+        return Fraction(0), None
+    probability = Fraction(z_num, denom**last)
+
+    # Backward pass over the same integer weights:
+    # B_t(x) = P(observations after t | X_t = x) * denom**(last - t); states
+    # failing the filter at t simply never enter backward[t].
+    backward: Dict[int, Dict[int, int]] = {last: {x: 1 for x in forward[last]}}
+    for t in range(last, 0, -1):
+        following = backward[t]
+        prev: Dict[int, int] = {}
+        for x in forward[t - 1]:
+            value = 0
+            if stays[x]:
+                value += stays[x] * following.get(x, 0)
+            if ups[x]:
+                value += ups[x] * following.get(x + 1, 0)
+            if downs[x]:
+                value += downs[x] * following.get(x - 1, 0)
+            prev[x] = value
+        backward[t - 1] = prev
+
+    distributions = []
+    for t in range(steps + 1):
+        step_dist: Dict[int, Fraction] = {}
+        if t <= last:
+            for x, weight in forward[t].items():
+                joint = weight * backward[t][x]
+                if joint:
+                    step_dist[x] = Fraction(joint, z_num)
+        else:
+            scale = z_num * denom ** (t - last)
+            for x, weight in forward[t].items():
+                step_dist[x] = Fraction(weight, scale)
+        distributions.append(step_dist)
+    return probability, distributions
+
+
+app = FastAPI(title="Isotope Envelope API", version="1.9.0")
 
 
 @app.post("/v1/envelope", response_model=EnvelopeResponse)
@@ -1540,6 +1729,41 @@ def compute_abundance_sensitivity(
             ]
         )
     return AbundanceSensitivityResponse(derivatives=derivatives)
+
+
+@app.post(
+    "/v1/exchange-trajectory",
+    response_model=ExchangeTrajectoryResponse,
+    response_model_exclude_none=True,
+)
+def compute_exchange_trajectory(
+    request: ExchangeTrajectoryRequest,
+) -> ExchangeTrajectoryResponse:
+    observations = [
+        (obs.step, obs.lower, obs.upper) for obs in request.observations
+    ]
+    probability, distributions = exchange_trajectory(
+        request.n,
+        request.m,
+        request.h,
+        request.b,
+        request.steps,
+        observations,
+    )
+    if distributions is None:
+        return ExchangeTrajectoryResponse(probability=to_fraction_str(probability))
+    return ExchangeTrajectoryResponse(
+        probability=to_fraction_str(probability),
+        distributions=[
+            [
+                HeavyCountPeak(
+                    heavy_count=count, probability=to_fraction_str(prob)
+                )
+                for count, prob in sorted(step_dist.items())
+            ]
+            for step_dist in distributions
+        ],
+    )
 
 
 @app.get("/healthz")

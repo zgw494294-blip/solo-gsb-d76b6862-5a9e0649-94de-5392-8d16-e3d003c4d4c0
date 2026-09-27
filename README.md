@@ -11,7 +11,9 @@
 观测偏移时、各组等概率无放回抽取原子形成碎片的**碎片谱**接口（母峰概率与碎片
 偏移的完整条件分布），以及对组内同位素间**丰度转移**求完整峰型
 dP(shift)/dε 在 ε=0 处精确右导数的**丰度灵敏度**接口（符号求导，不用有限差分），
-同样全程精确有理数运算。
+以及**有限浴池交换轨迹**推断接口（分子与浴池每步各均匀任选一位点交换同位素，
+在若干时点区间观测下给出联合概率与各步分子重同位素数的条件分布），
+同样全程精确有理数运算。。
 
 ## 启动
 
@@ -797,6 +799,87 @@ curl -s -X POST http://localhost:8000/v1/abundance-sensitivity \
   }'
 ```
 
+### `POST /v1/exchange-trajectory`
+
+**有限浴池交换轨迹**推断：分子有 `n` 个位点、浴池有 `m` 个位点，初始时分子含 `h` 个、
+浴池含 `b` 个重同位素。每一步**均匀且独立**地各选分子、浴池一个位点并交换其同位素
+（`n·m` 个位点对等概率；**同类交换也计步**），浴池同步更新，总重同位素数 `h + b` 守恒，
+因此分子重同位素数 `X_t` 是一条生灭链。请求给出 0～8 条观测：第 `step` 步**交换后**
+的分子重同位素数落在闭区间 `[lower, upper]` 内（`step = 0` 即初始状态 `X_0 = h`）。
+返回全部观测同时成立的**联合概率**；非零时返回 `0～steps` 每步在**全部观测条件下**的
+分子重同位素数分布。全程精确有理数运算，**不枚举交换序列、不做随机估计**。
+
+请求体：
+
+```json
+{
+  "n": 2,
+  "m": 2,
+  "h": 1,
+  "b": 1,
+  "steps": 2,
+  "observations": [
+    {"step": 2, "lower": 2, "upper": 2}
+  ]
+}
+```
+
+字段与约束（任一不满足即返回 **422**）：
+
+| 字段 | 约束 |
+| --- | --- |
+| `n` / `m` | 严格整数，1～40（分子 / 浴池位点数） |
+| `h` / `b` | 严格整数，`0 ≤ h ≤ n`、`0 ≤ b ≤ m`（各自初始重同位素数） |
+| `steps` | 严格整数，0～80 |
+| `observations` | 0～8 条；各 `step` **互异** |
+| `observations[].step` | 严格整数，`0 ≤ step ≤ steps` |
+| `observations[].lower` / `upper` | 严格整数，`0 ≤ lower ≤ upper ≤ n` |
+
+响应（200）。观测联合概率非零时：
+
+```json
+{
+  "probability": "1/8",
+  "distributions": [
+    [{"heavy_count": 1, "probability": "1/1"}],
+    [{"heavy_count": 1, "probability": "1/1"}],
+    [{"heavy_count": 2, "probability": "1/1"}]
+  ]
+}
+```
+
+观测联合概率为零时（省略 `distributions`）：
+
+```json
+{"probability": "0/1"}
+```
+
+- `probability`：全部观测同时成立的联合概率，已约分的 `"n/d"`；无观测时恒为 `"1/1"`。
+- `distributions`：长度 `steps + 1` 的数组，`distributions[t]` 为第 `t` 步交换后分子
+  重同位素数在**全部观测条件下**的分布，仅含概率非零的计数，按 `heavy_count` 升序，
+  概率为已约分的 `"n/d"`，每步各项之和恒为 `1/1`。仅在 `probability` 非零时返回。
+
+上例中 `n = m = 2`、`h = b = 1`（总重同位素数 2）：从 `X_0 = 1` 出发，每步 4 个位点对中
+上移、不动、下移各占 1、2、1 对，故 `X_2 = 2` 只能沿 `1 → 1 → 2` 到达，联合概率为
+`1/2 × 1/4 = 1/8`；在该条件下每步的计数都被唯一确定为 1、1、2。
+
+### 调用示例
+
+```bash
+curl -s -X POST http://localhost:8000/v1/exchange-trajectory \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "n": 2,
+    "m": 2,
+    "h": 1,
+    "b": 1,
+    "steps": 2,
+    "observations": [
+      {"step": 2, "lower": 2, "upper": 2}
+    ]
+  }'
+```
+
 ### `GET /healthz`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -883,6 +966,18 @@ DP 全程在整数上进行；最优窗口端点必落在**权重为正**的格�
 （例如必须用到零丰度受体的路径）也自然保留；卷积合并后导数恰好抵消为零的
 偏移则不列出。各转移共享一份未扰动的组分布，相互独立地求导。
 
+`/v1/exchange-trajectory` 中总重同位素数 `T = h + b` 守恒（浴池持有 `T − X_t` 个），
+故分子重同位素数 `X_t` 自身就是 0..n 上的生灭链：每步 `n·m` 个位点对等概率，
+转移概率分母同为 `n·m`，整数分子为 `up(x) = (n−x)(T−x)`（轻出重进）、
+`down(x) = x(m−T+x)`（重出轻进）、`stay(x) = n·m − up − down`（同类交换），
+在可行边界 `max(0, T−m) ≤ x ≤ min(n, T)` 处自动为零。前向递推携带精确整数权重
+`A_t`（`α_t(x) = A_t[x] / (n·m)^t`），在每个观测时点把违反区间的状态置零；
+最后观测时刻 `last` 的剩余质量即联合概率 `z / (n·m)^last`。后向递推携带
+`B_t(x) = P(之后的观测 | X_t = x) · (n·m)^(last−t)`（同一组整数权重），于是每步的
+条件概率只做一次约分：`A_t[x]·B_t[x] / z`；`last` 之后的步取 `B = 1` 并补分母因子
+`(n·m)^(t−last)`。联合概率为零时返回 `probability="0/1"` 并省略 `distributions`；
+全程不枚举任何交换序列。
+
 ## 测试
 
 ```bash
@@ -897,13 +992,14 @@ pytest
 贝叶斯暴力求解器的随机对拍、判别窗口规划与穷举所有不相交窗口组合并按
 （|p0−p1|、格数、窗口数、展平端点）决胜的暴力求解器的随机对拍、碎片谱与枚举
 全部（同位素取值 × 无放回子集）路径的暴力求解器的随机对拍、丰度灵敏度与逐路径
-枚举"每个原子概率为 ε 的一次多项式"（截断到 ε 的一次项）的暴力求导器的随机对拍，
-以及全部非法输入的 422 用例。
+枚举"每个原子概率为 ε 的一次多项式"（截断到 ε 的一次项）的暴力求导器的随机对拍、
+交换轨迹与枚举全部 `(n·m)^steps` 个位点选取序列（逐序列模拟重同位素位点集合）的
+暴力求解器的随机对拍，以及全部非法输入的 422 用例。
 
 ## 项目结构
 
 ```
-app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 带符号权重窗口 DP（采集/判别共用）+ 检出概率 DP + 候选/偏移后验 + 碎片谱 + 丰度灵敏度符号求导
+app/main.py          # FastAPI 应用：校验模型 + 精确卷积 + 精确有理数 LP + 带符号权重窗口 DP（采集/判别共用）+ 检出概率 DP + 候选/偏移后验 + 碎片谱 + 丰度灵敏度符号求导 + 交换轨迹前向-后向精确推断
 tests/test_envelope.py
 tests/test_peak_attribution.py
 tests/test_mixture_bounds.py
@@ -913,6 +1009,7 @@ tests/test_candidate_posterior.py
 tests/test_discrimination_plan.py
 tests/test_fragment_spectrum.py
 tests/test_abundance_sensitivity.py
+tests/test_exchange_trajectory.py
 requirements.txt     # 运行依赖
 requirements-dev.txt # 测试依赖
 Dockerfile
